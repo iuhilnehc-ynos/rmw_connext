@@ -62,3 +62,40 @@ rmw_connext_shared_cpp::create_topic(
   }
   return topic;
 }
+
+DDS::ContentFilteredTopic *
+rmw_connext_shared_cpp::create_content_filtered_topic(
+  const rmw_node_t * node,
+  const char * cft_name,
+  DDS::Topic * topic,
+  const char * filter_expression,
+  const rcutils_string_array_t * expression_parameters)
+{
+  assert(node);
+  assert(node->data);
+  assert(cft_name);
+  assert(topic);
+  assert(filter_expression);
+
+  auto node_info = static_cast<ConnextNodeInfo *>(node->data);
+  auto participant = static_cast<DDS::DomainParticipant *>(node_info->participant);
+
+  std::lock_guard<std::mutex> guard(node_info->topic_creation_mutex);
+
+  DDS_StringSeq parameters;
+  if (expression_parameters) {
+    if (!parameters.from_array(
+        const_cast<const char **>(expression_parameters->data), expression_parameters->size))
+    {
+      RMW_SET_ERROR_MSG("failed to load expression parameters data");
+      return nullptr;
+    }
+  }
+  DDS::ContentFilteredTopic * cft = participant->create_contentfilteredtopic(
+    cft_name, topic, filter_expression, parameters);
+  if (cft == NULL) {
+    RMW_SET_ERROR_MSG("failed to create content filtered topic");
+    return nullptr;
+  }
+  return cft;
+}

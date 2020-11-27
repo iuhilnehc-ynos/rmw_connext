@@ -14,6 +14,8 @@
 
 #include <string>
 
+#include "rcutils/strdup.h"
+
 #include "rmw/allocators.h"
 #include "rmw/error_handling.h"
 #include "rmw/impl/cpp/macros.hpp"
@@ -111,6 +113,7 @@ rmw_create_subscription(
   DDS::ReturnCode_t status;
   DDS::Subscriber * dds_subscriber = nullptr;
   DDS::Topic * topic = nullptr;
+  DDS::ContentFilteredTopic * content_filtered_topic = nullptr;
   DDS::DataReader * topic_reader = nullptr;
   DDS::ReadCondition * read_condition = nullptr;
   void * info_buf = nullptr;
@@ -187,6 +190,20 @@ rmw_create_subscription(
     goto fail;
   }
 
+  // to create a content filtered topic if necessary
+  if (subscription_options->filter_expression) {
+    content_filtered_topic = rmw_connext_shared_cpp::create_content_filtered_topic(
+      node, topic_name, topic,
+      subscription_options->filter_expression, subscription_options->expression_parameters);
+    if (!content_filtered_topic) {
+      // error already set
+      goto fail;
+    }
+    subscription->is_cft_supported = true;
+  } else {
+    subscription->is_cft_supported = false;
+  }
+
   if (!get_datareader_qos(participant, *qos_profile, topic_str, datareader_qos)) {
     // error string was set within the function
     goto fail;
@@ -195,9 +212,15 @@ rmw_create_subscription(
   DDS::String_free(topic_str);
   topic_str = nullptr;
 
-  topic_reader = dds_subscriber->create_datareader(
-    topic, datareader_qos,
-    NULL, DDS::STATUS_MASK_NONE);
+  if (content_filtered_topic) {
+    topic_reader = dds_subscriber->create_datareader(
+      content_filtered_topic, datareader_qos,
+      NULL, DDS::STATUS_MASK_NONE);
+  } else {
+    topic_reader = dds_subscriber->create_datareader(
+      topic, datareader_qos,
+      NULL, DDS::STATUS_MASK_NONE);
+  }
   if (!topic_reader) {
     RMW_SET_ERROR_MSG("failed to create datareader");
     goto fail;
@@ -220,6 +243,7 @@ rmw_create_subscription(
   RMW_TRY_PLACEMENT_NEW(subscriber_info, info_buf, goto fail, ConnextStaticSubscriberInfo, )
   info_buf = nullptr;  // Only free the subscriber_info pointer; don't need the buf pointer anymore.
   subscriber_info->topic_ = topic;
+  subscriber_info->content_filtered_topic_ = content_filtered_topic;
   subscriber_info->dds_subscriber_ = dds_subscriber;
   subscriber_info->topic_reader_ = topic_reader;
   subscriber_info->read_condition_ = read_condition;
@@ -239,6 +263,7 @@ rmw_create_subscription(
   memcpy(const_cast<char *>(subscription->topic_name), topic_name, strlen(topic_name) + 1);
 
   subscription->options = *subscription_options;
+  // todo. add a copy function for rmw_subscription_options_t
 
   if (!qos_profile->avoid_ros_namespace_conventions) {
     mangled_name = topic_reader->get_topicdescription()->get_name();
@@ -303,6 +328,14 @@ fail:
       (std::cerr << ss.str()).flush();
     }
   }
+  if (content_filtered_topic) {
+    if (participant->delete_contentfilteredtopic(content_filtered_topic) != DDS::RETCODE_OK) {
+      std::stringstream ss;
+      std::cerr << "leaking topic while handling failure at " <<
+        __FILE__ << ":" << __LINE__ << '\n';
+      (std::cerr << ss.str()).flush();
+    }
+  }
   if (topic) {
     if (participant->delete_topic(topic) != DDS::RETCODE_OK) {
       std::stringstream ss;
@@ -332,6 +365,7 @@ fail:
   if (listener_buf) {
     rmw_free(listener_buf);
   }
+  // free options
 
   return NULL;
 }
@@ -393,6 +427,133 @@ rmw_subscription_get_actual_qos(
 }
 
 rmw_ret_t
+rmw_subscription_set_cft_expression_parameters(
+  const rmw_subscription_t * subscription,
+  const char * filter_expression,
+  const rcutils_string_array_t * expression_parameters)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription,
+    subscription->implementation_identifier,
+    rti_connext_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  if (subscription->is_cft_supported) {
+    RMW_SET_ERROR_MSG("content filter topic is not supported for this subscription");
+    return RMW_RET_ERROR;
+  }
+
+  auto info = static_cast<ConnextStaticSubscriberInfo *>(subscription->data);
+  DDS::ContentFilteredTopic * content_filtered_topic = info->content_filtered_topic_;
+
+  // todo. test
+  DDS_StringSeq parameters;
+  if (expression_parameters) {
+    if (!parameters.from_array(
+        const_cast<const char **>(expression_parameters->data), expression_parameters->size))
+    {
+      RMW_SET_ERROR_MSG("failed to load expression parameters data");
+      return RMW_RET_ERROR;
+    }
+  }
+
+  DDS::ReturnCode_t status = content_filtered_topic->set_expression(filter_expression, parameters);
+  if (DDS::RETCODE_OK != status) {
+    RMW_SET_ERROR_MSG("failed to set filter expression");
+    return RMW_RET_ERROR;
+  }
+
+  return RMW_RET_OK;
+}
+
+rmw_ret_t
+rmw_subscription_get_cft_expression_parameters(
+  const rmw_subscription_t * subscription,
+  char ** filter_expression,
+  rcutils_string_array_t * expression_parameters)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(filter_expression, RMW_RET_INVALID_ARGUMENT);
+  if (*filter_expression) {
+    RMW_SET_ERROR_MSG("filter expression must be NULL, otherwise there might be memory leak");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription,
+    subscription->implementation_identifier,
+    rti_connext_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  if (subscription->is_cft_supported) {
+    RMW_SET_ERROR_MSG("content filter topic is not supported for this subscription");
+    return RMW_RET_ERROR;
+  }
+
+  rmw_ret_t ret;
+  rcutils_ret_t rcutils_ret;
+  int parameters_len;
+  rcutils_allocator_t allocator = rcutils_get_default_allocator();
+
+  auto info = static_cast<ConnextStaticSubscriberInfo *>(subscription->data);
+  DDS::ContentFilteredTopic * content_filtered_topic = info->content_filtered_topic_;
+
+  // get expression (todo, need to free memory from connext?)
+  const char* expression = content_filtered_topic->get_filter_expression();
+  if (!expression) {
+    RMW_SET_ERROR_MSG("failed to get filter expression");
+    return RMW_RET_ERROR;
+  }
+
+  *filter_expression = rcutils_strdup(expression, allocator);
+  if (NULL == *filter_expression) {
+    RMW_SET_ERROR_MSG("failed to duplicate string");
+    return RMW_RET_BAD_ALLOC;
+  }
+
+  // get parameters
+  DDS_StringSeq parameters;
+  DDS::ReturnCode_t status = content_filtered_topic->get_expression_parameters(parameters);
+  if (DDS::RETCODE_OK != status) {
+    RMW_SET_ERROR_MSG("failed to get expression parameters");
+    ret = RMW_RET_ERROR;
+    goto clean;
+  }
+
+  parameters_len = parameters.length();
+  rcutils_ret = rcutils_string_array_init(expression_parameters, parameters_len, &allocator);
+  if (rcutils_ret != RCUTILS_RET_OK) {
+    RMW_SET_ERROR_MSG("failed to init string array for expression parameters");
+    ret = RMW_RET_ERROR;
+    goto clean;
+  }
+  for (int i = 0; i < parameters_len; ++i) {
+    char * parameter = rcutils_strdup(parameters[i], allocator);
+    if (!parameter) {
+      RMW_SET_ERROR_MSG("failed to allocate memory for parameter");
+      ret = RMW_RET_BAD_ALLOC;
+      goto clean;
+    }
+    expression_parameters->data[i] = parameter;
+  }
+
+  return RMW_RET_OK;
+
+clean:
+
+  if (*filter_expression) {
+    allocator.deallocate(*filter_expression, allocator.state);
+    *filter_expression = nullptr;
+  }
+
+  if (RCUTILS_RET_OK != rcutils_string_array_fini(expression_parameters)) {
+    RCUTILS_LOG_ERROR("Error while finalizing expression parameter due to another error");
+  }
+  return ret;
+}
+
+rmw_ret_t
 rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subscription)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
@@ -445,6 +606,17 @@ rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subscription)
     }
   }
 
+  if (participant->delete_contentfilteredtopic(
+      subscriber_info->content_filtered_topic_) != DDS::RETCODE_OK)
+  {
+    if (RMW_RET_OK == ret) {
+      RMW_SET_ERROR_MSG("failed to delete topic");
+      ret = RMW_RET_ERROR;
+    } else {
+      RMW_SAFE_FWRITE_TO_STDERR("failed to delete topic\n");
+    }
+  }
+
   if (participant->delete_topic(subscriber_info->topic_) != DDS::RETCODE_OK) {
     if (RMW_RET_OK == ret) {
       RMW_SET_ERROR_MSG("failed to delete topic");
@@ -478,6 +650,8 @@ rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subscription)
   rmw_free(subscriber_info);
 
   rmw_free(const_cast<char *>(subscription->topic_name));
+
+  // free options
   rmw_subscription_free(subscription);
 
   return ret;
